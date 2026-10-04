@@ -1,0 +1,11 @@
+[package]
+name = "asap-driver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "asap-driver"
+path = "src/main.rs"
+
+# Tidak perlu depend on asap-runtime di sini —
+# kita kenali AsapOwned via string matching di type system rustc

@@ -1,0 +1,8 @@
+[package]
+name = "asap-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+asap-macro   = { path = "../asap-macro" }
+asap-runtime = { path = "../asap-runtime" }

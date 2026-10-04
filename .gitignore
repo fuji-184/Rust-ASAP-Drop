@@ -1,0 +1,28 @@
+# Build output
+/target/
+
+# Rust backup files dari rustfmt/cargo
+**/*.rs.bk
+
+# Windows debug symbols
+*.pdb
+
+# Env & secrets lokal
+.env
+.env.*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+*.orig
+*.rej
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Log & file sementara
+*.log
+/tmp/

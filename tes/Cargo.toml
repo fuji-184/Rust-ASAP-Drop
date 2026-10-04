@@ -1,0 +1,8 @@
+[package]
+name = "tes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+asap-macro = { version = "0.1.0", path = "../asap-macro" }
+asap-runtime = { version = "0.1.0", path = "../asap-runtime" }
