@@ -21,9 +21,19 @@ impl Drop for Tracked {
     }
 }
 
+fn borrow(a: &Tracked) {
+    println!("BORROW early 2 is borrowed by other function, the new 2nd");
+    
+}
+
+fn moved(a: Tracked) {
+    println!("MOVE early 2 is moved to other function, the new 2nd");
+    
+}
+
 fn main() {
-    let normal = Tracked::new("normal");
-    let early  = asap!(Tracked::new("early"));
+    let normal = Tracked::new("variable that uses scope based drop");
+    let early  = asap!(Tracked::new("variable that uses asap drop"));
 
     normal.use_it();
     early.use_it();
@@ -31,4 +41,8 @@ fn main() {
     normal.use_it();
 
     drop(normal);
+
+    let early  = asap!(Tracked::new("variable that uses asap drop, the new 2nd"));
+    borrow(&early);
+    moved(early);
 }
