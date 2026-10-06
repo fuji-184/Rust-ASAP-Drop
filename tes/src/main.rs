@@ -51,13 +51,15 @@ fn main() {
 
     let early  = asap!(Tracked::new("variable that uses asap drop, branching"));
 
-    if 1 == 1 {
-        borrow(&early);
-        
+    if 1 == 12 {
+        borrow(&early);     
     } else {
-        moved(early); 
+        borrow(&early);
     }
 
     println!("after branching");
 
+    borrow(&early);
+
 }
+

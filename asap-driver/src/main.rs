@@ -46,6 +46,7 @@ fn asap_mir_built<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx Steal<Body<
     // (mis. query belum siap), tidak ada yang termutasi — aman di-skip.
     let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let body = steal.borrow();
+        eprintln!("[asap] === {} ===", tcx.def_path_str(def));
         pass::plan_asap_transform(tcx, &body)
     }));
 

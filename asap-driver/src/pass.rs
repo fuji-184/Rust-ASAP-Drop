@@ -1,6 +1,6 @@
 // pass.rs
 //
-// Inti dari ASAP Drop:
+// Inti dari ASAP Drop (semantik setara NLL, per-path):
 //
 //  1. Scan locals yang diinisialisasi via `asap_runtime::__asap_identity`
 //     (hasil macro `asap!`)                        → "candidates"
@@ -9,27 +9,29 @@
 //  2. Taint flow-insensitive: local apa pun yang nilainya diturunkan dari
 //     candidate (`&a`, hasil call yang menerima borrow candidate, salinan
 //     ref, ...) dicatat sebagai turunan candidate.
-//  3. Untuk tiap candidate, cari last_use = lokasi terakhir candidate
-//     ATAU turunannya dipakai (mencakup FakeRead/PlaceMention/asm/intrinsic).
-//     StorageDead SENGAJA tidak dipakai: local bernama (mis. `let r = &*a`)
-//     di-StorageDead di akhir fungsi, jauh setelah borrow-nya mati menurut
-//     NLL. last_use + validasi borrowck sudah cukup dan tepat.
-//  4. safe_drop_point = last_use (move-out di-skip: value sudah pindah,
-//     mis. di-pass by-value ke fungsi lain — early drop tidak ada gunanya)
-//  5. Split basic block di safe_drop_point, sisipkan Drop terminator
-//  6. Netralkan scope drop lama (Drop → Goto) → tidak double-drop
+//  3. Untuk tiap candidate, kumpulkan USES (borrow-uses) dan MOVES (direct).
+//  4. Titik sisip (bisa LEBIH DARI SATU per candidate):
+//       (a) Setelah tiap per-path-last BORROW-use: use yang tidak mencapai
+//           use lain (cabang berbeda → dua titik, lurus → satu titik).
+//       (b) Setelah tiap MOVE langsung ("drop setelah move terakhir").
+//           Drop di sini selalu no-op kondisional (value sudah pindah),
+//           jadi aman; borrowck menolak bila ada use-after-move.
+//     Tiap titik: guard urutan (titik tidak boleh mencapai use mana pun;
+//     use di cabang disjoint yang tak terjangkau diabaikan), guard loop,
+//     guard move (titik borrow tak boleh mencapai Move), titik harus
+//     mendominasi ≥1 situs scope drop. Hoist maju (lewat blok tanpa use,
+//     hanya single-successor) agar `if { use }` mendarat di JOIN.
+//     Titik identik dari anchor berbeda di-dedupe (satu drop cukup).
+//  5. Netralkan SELEKTIF: hanya situs scope drop yang didominasi ≥1 titik
+//     sisip. Path lain (return-diverge, path yang me-move) memakai drop
+//     aslinya yang tetap utuh.
+//  6. Split langsung di lokasi tervalidasi (AfterStmt split / split di
+//     awal successor). TIDAK PERNAH edge-insert: guard memeriksa blok,
+//     sisipan harus di blok yang sama (dulu mismatch ini menyebabkan
+//     cabang hilang + drop ganda).
 //
-// Cara kerja dengan compiler (nightly 1.97):
-//  - main.rs membungkus query `mir_built` via `override_queries`.
-//    `plan_asap_transform` dipanggil SEBELUM borrowck, sehingga transform
-//    yang tidak sound ditolak borrowck sebagai compile error (fail-safe),
-//    bukan silent UB.
-//  - Guard tambahan: semua use harus terurut SEBELUM titik drop menurut
-//    CFG (`Location::is_predecessor_of`), dan titik drop harus mencapai
-//    scope drop lama. Kasus loop/branch yang meragukan di-skip (fallback
-//    ke drop normal di akhir scope).
-//  - Kasus move-out (`Move` langsung dari candidate, mis. di-pass
-//    by-value ke fungsi lain) di-skip: tidak ada yang perlu di-drop awal.
+// Fail-safe: mutasi di `mir_built` (SEBELUM borrowck). Penempatan yang
+// melanggar aturan borrow/move ditolak sebagai compile error, bukan UB.
 //
 // Catatan kompatibilitas nightly:
 //  - `MirPass` tidak lagi publik → pass ini struct biasa.
@@ -41,6 +43,7 @@
 
 #![allow(dead_code)]
 
+use rustc_data_structures::graph::dominators::Dominators;
 use rustc_middle::{
     mir::{BasicBlock, BasicBlockData, Body, Local, Location, Operand, Place, Rvalue,
         StatementKind, Terminator, TerminatorKind, UnwindAction},
@@ -49,25 +52,21 @@ use rustc_middle::{
 
 use std::collections::{HashMap, HashSet};
 
-/// Satu early-drop yang akan diterapkan, plus cara menyisipkannya.
-#[derive(Debug, Clone, Copy)]
+/// Satu early-drop yang akan diterapkan: split blok di `exec`
+/// (`exec.statement_index` dalam `0..=len`, `== len` = tepat sebelum
+/// terminator) dan sisipkan Drop; netralkan `sites`.
+/// Selalu split di lokasi tervalidasi — TIDAK PERNAH edge-insert
+/// (edge-insert + guard blok-level terbukti salah: false path mencapai
+/// blok tanpa lewat edge insert → leak).
+#[derive(Debug, Clone)]
 pub struct AsapDrop {
     local: Local,
-    /// Lokasi use terakhir (untuk log/guard).
+    /// Lokasi anchor (use/move terakhir di path-nya, untuk log).
     after: Location,
-    old_block: BasicBlock,
-    point: InsertPoint,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum InsertPoint {
-    /// Split `after.block` tepat setelah statement `after`.
-    AfterStmt,
-    /// Sisipkan block drop baru antara `pred` dan successor normalnya
-    /// (dipakai bila use terakhir adalah terminator seperti `Call`,
-    /// yang tidak bisa di-split). Ditentukan saat apply lewat successor
-    /// SAAT ITU ( chaining otomatis bila beberapa drop berbagi pred).
-    BeforeSucc { pred: BasicBlock },
+    /// Lokasi eksekusi drop (hasil hoist, untuk split + sort).
+    exec: Location,
+    /// Subset situs scope drop yang didominasi titik ini → dinetralkan.
+    sites: Vec<BasicBlock>,
 }
 
 // ── Entry: susun rencana transform untuk satu body ─────────────────────────
@@ -83,6 +82,11 @@ pub fn plan_asap_transform<'a>(tcx: TyCtxt<'a>, body: &Body<'a>) -> Vec<AsapDrop
     // dari candidate (mis. `let cloned = early.clone()`) ikut menjadi
     // kandidat — mereka value independen yang juga boleh di-drop awal.
     // Iterasi sampai fixpoint (promosi hanya menambah, berhimpit di #locals).
+    //
+    // Catatan return: TIDAK ada skip khusus. `return early` (move) tidak
+    // punya successor (titik move di-skip struktural); `return &x` dari
+    // local sudah E0515 dengan/tanpa driver; value-return murni tidak
+    // memperpanjang borrow. Tracking jalan sampai last use sesuai NLL.
     let mut taint = compute_taint(body, &candidates);
     loop {
         let mut grown = false;
@@ -108,88 +112,192 @@ pub fn plan_asap_transform<'a>(tcx: TyCtxt<'a>, body: &Body<'a>) -> Vec<AsapDrop
         taint = compute_taint(body, &candidates);
     }
 
-    let mut analysis = analyze_body(body, &candidates, &taint);
-    for info in analysis.values_mut() {
-        info.safe_drop_point = info.last_use;
-    }
+    let analysis = analyze_body(body, &candidates, &taint);
+
+    // Dominator dipakai guard titik sisip.
+    let dom: &Dominators<BasicBlock> = body.basic_blocks.dominators();
 
     let mut plan = Vec::new();
     for (&local, info) in &analysis {
         eprintln!(
-            "[asap]   {:?}: last_use={:?}, scope_drop={:?}, moved_out={}",
-            local, info.last_use, info.existing_drop_block, info.moved_out
+            "[asap]   {:?}: borrow_uses={:?}, moves={:?}, scope_drops={:?}, moved_out={}",
+            local, info.borrow_uses, info.moves, info.existing_drop_blocks, info.moved_out
         );
-        let (Some(after), Some(old_block)) = (info.safe_drop_point, info.existing_drop_block)
-        else {
-            eprintln!("[asap]   skip {:?}: no use or no scope drop found", local);
+        if info.existing_drop_blocks.is_empty() {
+            eprintln!("[asap]   skip {:?}: no scope drop found", local);
             continue;
-        };
-        if info.moved_out {
-            eprintln!("[asap]   skip {:?}: moved out, early drop pointless", local);
+        }
+        if info.borrow_uses.is_empty() && info.moves.is_empty() {
+            eprintln!("[asap]   skip {:?}: no use found", local);
             continue;
         }
 
-        // Tentukan titik sisip.
-        let after_len = body.basic_blocks[after.block].statements.len();
-        let (point, drop_exec_loc) = if after.statement_index < after_len {
-            (InsertPoint::AfterStmt, after)
-        } else {
-            // Use terakhir adalah terminator (mis. Call `use_it()`):
-            // sisipkan di awal successor normalnya.
-            let term = body.basic_blocks[after.block].terminator();
-            let Some(succ) = single_normal_succ(term) else {
-                eprintln!("[asap]   skip {:?}: last use has no single successor", local);
+        // Anchor borrow: per-path-last uses (use yang tidak mencapai use
+        // lain — cabang berbeda menghasilkan beberapa anchor).
+        let mut anchors: Vec<(Location, bool)> = Vec::new(); // (loc, is_move)
+        for &u in &info.borrow_uses {
+            let dominated_by_later = info.borrow_uses.iter().any(|&v| {
+                !same_location(u, v) && u.is_predecessor_of(v, body)
+            });
+            if !dominated_by_later {
+                anchors.push((u, false));
+            }
+        }
+        // Anchor move: setiap Move langsung ("drop setelah move terakhir",
+        // satu per lokasi move — no-op kondisional bila sudah pindah).
+        for &m in &info.moves {
+            anchors.push((m, true));
+        }
+
+        for (after, is_move_anchor) in anchors {
+            // Posisi awal: tepat setelah anchor.
+            let after_len = body.basic_blocks[after.block].statements.len();
+            let mut drop_exec_loc = if after.statement_index < after_len {
+                Location { block: after.block, statement_index: after.statement_index + 1 }
+            } else {
+                // Anchor di posisi terminator (mis. Call):
+                // mulai dari awal successor normalnya.
+                let term = body.basic_blocks[after.block].terminator();
+                let Some(succ) = single_normal_succ(term) else {
+                    eprintln!("[asap]   skip {:?} at {:?}: no single successor", local, after);
+                    continue;
+                };
+                // Blok cleanup dan non-cleanup tidak boleh dicampur.
+                if body.basic_blocks[after.block].is_cleanup
+                    != body.basic_blocks[succ].is_cleanup
+                {
+                    eprintln!("[asap]   skip {:?} at {:?}: cleanup mismatch", local, after);
+                    continue;
+                }
+                Location { block: succ, statement_index: 0 }
+            };
+
+            // Hoist: maju ke depan selama titik belum mendominasi situs
+            // mana pun. Tujuannya: kasus `if { use }` (tanpa else) mendarat
+            // di JOIN (mendominasi scope drop), bukan tertahan di dalam
+            // cabang (yang akan leak di path lain). Maksimalitas anchor
+            // menjamin tidak ada use yang dilewati (kecuali via loop,
+            // yang digagalkan guard). Berhenti (gagal) di: cabang
+            // multi-successor, cleanup mismatch, blok berulang (loop),
+            // atau mencapai situs itu sendiri (nol manfaat).
+            //
+            // Titik final SELALU di-split langsung (bukan edge-insert):
+            // guard dan sisipan mengacu ke lokasi yang sama sehingga
+            // tidak ada path yang lolos tanpa drop.
+            let mut visited = HashSet::new();
+            let placed: Option<Vec<BasicBlock>> = loop {
+                // Guard urutan: titik eksekusi TIDAK BOLEH mencapai use mana
+                // pun (itu berarti use-after-drop, atau loop-back).
+                // Use yang tidak terjangkau dari titik ini — mis. use di
+                // cabang lain yang disjoint — tidak relevan dan diabaikan
+                // (path-nya dijamin oleh guard dominansi di bawah).
+                let ordered = info.borrow_uses.iter().all(|&u| {
+                    same_location(u, drop_exec_loc)
+                        || !drop_exec_loc.is_predecessor_of(u, body)
+                });
+                if !ordered {
+                    eprintln!("[asap]     hoist {:?}: stop, reaches a later use", drop_exec_loc);
+                    break None;
+                }
+                // Guard move: titik borrow TIDAK boleh mencapai Move mana
+                // pun (drop-then-move = borrowck error). Titik move
+                // dikecualikan (drop setelah move = no-op yang aman).
+                if !is_move_anchor {
+                    let hits_move = info.moves.iter().any(|&m| {
+                        drop_exec_loc.is_predecessor_of(m, body)
+                            && !same_location(drop_exec_loc, m)
+                    });
+                    if hits_move {
+                        eprintln!("[asap]     hoist {:?}: stop, reaches a move", drop_exec_loc);
+                        break None;
+                    }
+                }
+                // Situs yang didominasi titik ini (yang akan dinetralkan).
+                let mut sites = Vec::new();
+                let mut zero_benefit = false;
+                for &site in &info.existing_drop_blocks {
+                    let site_loc = Location {
+                        block: site,
+                        statement_index: body.basic_blocks[site].statements.len(),
+                    };
+                    if same_location(drop_exec_loc, site_loc) {
+                        zero_benefit = true;
+                        break;
+                    }
+                    if drop_exec_loc.dominates(site_loc, dom) {
+                        sites.push(site);
+                    }
+                }
+                if zero_benefit || !sites.is_empty() {
+                    break if sites.is_empty() { None } else { Some(sites) };
+                }
+                // Maju satu langkah.
+                let len = body.basic_blocks[drop_exec_loc.block].statements.len();
+                if drop_exec_loc.statement_index < len {
+                    // Maju dalam blok.
+                    drop_exec_loc.statement_index += 1;
+                    continue;
+                }
+                // Ujung blok: hanya lanjut lewat single successor.
+                if !visited.insert(drop_exec_loc.block) {
+                    eprintln!("[asap]     hoist {:?}: stop, loop (self)", drop_exec_loc);
+                    break None; // loop
+                }
+                let term = body.basic_blocks[drop_exec_loc.block].terminator();
+                let Some(succ) = single_normal_succ(term) else {
+                    eprintln!("[asap]     hoist {:?}: stop, no single succ", drop_exec_loc);
+                    break None; // cabang/return/yield/asm: berhenti
+                };
+                if body.basic_blocks[drop_exec_loc.block].is_cleanup
+                    != body.basic_blocks[succ].is_cleanup
+                {
+                    eprintln!("[asap]     hoist {:?}: stop, cleanup mismatch", drop_exec_loc);
+                    break None;
+                }
+                if !visited.insert(succ) {
+                    eprintln!("[asap]     hoist {:?}: stop, loop (succ)", drop_exec_loc);
+                    break None; // loop
+                }
+                drop_exec_loc = Location { block: succ, statement_index: 0 };
+            };
+            let Some(sites) = placed else {
+                eprintln!("[asap]   skip {:?} at {:?}: no sound drop point", local, after);
                 continue;
             };
-            // Blok cleanup dan non-cleanup tidak boleh dicampur.
-            if body.basic_blocks[after.block].is_cleanup
-                != body.basic_blocks[succ].is_cleanup
-            {
-                eprintln!("[asap]   skip {:?}: cleanup mismatch", local);
-                continue;
-            }
-            let start = Location { block: succ, statement_index: 0 };
-            (InsertPoint::BeforeSucc { pred: after.block }, start)
-        };
 
-        // Semua use harus terurut sebelum titik eksekusi drop.
-        let ordered = info.uses.iter().all(|&u| {
-            same_location(u, drop_exec_loc) || u.is_predecessor_of(drop_exec_loc, body)
-        });
-        if !ordered {
-            eprintln!("[asap]   skip {:?}: use order unclear (loop/branch?)", local);
-            continue;
+            eprintln!(
+                "[asap] early-drop {:?} at {:?} (neutralize {:?})",
+                local, drop_exec_loc, sites
+            );
+            plan.push(AsapDrop { local, after, exec: drop_exec_loc, sites });
         }
-        // Titik eksekusi drop harus mencapai scope drop lama.
-        let drop_loc = Location {
-            block: old_block,
-            statement_index: body.basic_blocks[old_block].statements.len(),
-        };
-        if !(same_location(drop_exec_loc, drop_loc)
-            || drop_exec_loc.is_predecessor_of(drop_loc, body))
-        {
-            eprintln!("[asap]   skip {:?}: drop point cannot reach scope drop", local);
-            continue;
-        }
-
-        eprintln!(
-            "[asap] early-drop {:?} at {:?} (scope drop at {:?})",
-            local, drop_exec_loc, old_block
-        );
-        plan.push(AsapDrop { local, after, old_block, point });
     }
 
-    // BeforeSucc dulu (chaining via successor saat-itu), lalu AfterStmt
-    // menurun agar split tidak menggeser lokasi rencana lain.
+    // Dedupe: beberapa anchor (mis. use di kedua cabang) bisa hoist ke
+    // titik eksekusi yang SAMA (mis. awal join). Satu drop di sana sudah
+    // mencakup semua path tersebut — sisipan ganda = drop ganda.
     plan.sort_by(|a, b| {
-        fn rank(p: &AsapDrop) -> u8 {
-            match p.point {
-                InsertPoint::BeforeSucc { .. } => 0,
-                InsertPoint::AfterStmt => 1,
-            }
-        }
-        (rank(a), std::cmp::Reverse((a.after.block.as_u32(), a.after.statement_index)))
-            .cmp(&(rank(b), std::cmp::Reverse((b.after.block.as_u32(), b.after.statement_index))))
+        (a.local.as_u32(), a.exec.block.as_u32(), a.exec.statement_index).cmp(&(
+            b.local.as_u32(),
+            b.exec.block.as_u32(),
+            b.exec.statement_index,
+        ))
+    });
+    plan.dedup_by(|a, b| {
+        a.local == b.local
+            && a.exec.block == b.exec.block
+            && a.exec.statement_index == b.exec.statement_index
+    });
+    // Merge situs: item duplikat yang dibuang mungkin membawa situs yang
+    // tidak dimiliki item yang dipertahankan. Karena dedupe di atas hanya
+    // membuang item dengan exec IDENTIK, situsnya (hasil guard dominansi
+    // dari titik yang sama) juga identik — tidak ada yang hilang.
+
+    // Sortir menurun berdasar posisi eksekusi agar split tidak menggeser
+    // lokasi rencana lain dalam blok yang sama.
+    plan.sort_by(|a, b| {
+        std::cmp::Reverse((a.exec.block.as_u32(), a.exec.statement_index))
+            .cmp(&std::cmp::Reverse((b.exec.block.as_u32(), b.exec.statement_index)))
     });
     plan
 }
@@ -211,77 +319,26 @@ fn single_normal_succ(term: &Terminator<'_>) -> Option<BasicBlock> {
 
 /// Terapkan rencana ke body yang sudah di-borrow mutabel.
 /// Dipanggil setelah `plan_asap_transform` dari `asap_mir_built`.
+///
+/// Urutan penting: netralkan SEMUA scope drop dulu (tidak menggeser
+/// index), baru sisipkan early drops. Kalau dibalik, split bisa
+/// memindahkan terminator sehingga index situs basi menunjuk block
+/// yang salah (pernah menyebabkan drop ganda + cabang hilang).
 pub fn apply_asap_plan(body: &mut Body<'_>, plan: &[AsapDrop]) {
+    // Fase 1: netralkan situs scope drop yang didominasi titik sisip.
+    // (Tidak menggeser index; situs yang tidak didominasi tetap utuh
+    // untuk path lain — mis. path return atau path yang me-move.)
     for item in plan {
-        match item.point {
-            InsertPoint::AfterStmt => {
-                let new_bb = insert_drop_after(body, item.local, item.after);
-                // Kalau split terjadi di block yang sama dengan scope drop
-                // lama, drop lama sudah ikut pindah ke block baru.
-                let stale =
-                    if item.old_block == item.after.block { new_bb } else { item.old_block };
-                neutralize_scope_drop(body, stale);
-                eprintln!("[asap]   applied early drop of {:?} at {:?}", item.local, item.after);
-            }
-            InsertPoint::BeforeSucc { pred } => {
-                insert_drop_before_succ(body, item.local, pred);
-                neutralize_scope_drop(body, item.old_block);
-                eprintln!(
-                    "[asap]   applied early drop of {:?} after {:?}",
-                    item.local, item.after
-                );
-            }
+        for &site in &item.sites {
+            neutralize_scope_drop(body, site);
         }
     }
-}
-
-/// Sisipkan block drop baru antara `pred` dan successor normalnya SAAT INI
-/// (bukan yang tercatat — chaining otomatis bila berbagi pred).
-/// Return block drop baru.
-fn insert_drop_before_succ(
-    body: &mut Body<'_>,
-    local: Local,
-    pred: BasicBlock,
-) -> BasicBlock {
-    let blocks = body.basic_blocks.as_mut();
-    let source_info = blocks[pred].terminator().source_info;
-    let is_cleanup = blocks[pred].is_cleanup;
-
-    // Successor saat ini (sudah di-guard single-succ saat plan).
-    let succ = single_normal_succ(blocks[pred].terminator())
-        .expect("BeforeSucc pred lost its single successor");
-
-    // Block drop baru: tanpa statement, langsung Drop → succ.
-    let drop_bb = blocks.push(BasicBlockData::new_stmts(
-        Vec::new(),
-        Some(Terminator {
-            source_info,
-            kind: TerminatorKind::Drop {
-                place: Place::from(local),
-                target: succ,
-                unwind: UnwindAction::Continue,
-                replace: false,
-                drop: None,
-                async_fut: None,
-            },
-        }),
-        is_cleanup,
-    ));
-
-    // Arahkan successor normal pred ke block drop baru.
-    // (Hanya successor normal; edge unwind/cleanup dibiarkan.)
-    let term = blocks[pred].terminator_mut();
-    match &mut term.kind {
-        TerminatorKind::Call { target: Some(t), .. } => *t = drop_bb,
-        TerminatorKind::Goto { target } => *target = drop_bb,
-        TerminatorKind::Assert { target, .. } => *target = drop_bb,
-        TerminatorKind::Drop { target, .. } => *target = drop_bb,
-        TerminatorKind::FalseEdge { real_target, .. } => *real_target = drop_bb,
-        TerminatorKind::FalseUnwind { real_target, .. } => *real_target = drop_bb,
-        _ => unreachable!("BeforeSucc pred lost its single successor"),
+    // Fase 2: sisipkan early drops, menurun berdasar posisi eksekusi
+    // (split di blok ber-index besar dulu agar tidak menggeser yang lain).
+    for item in plan {
+        insert_drop_at(body, item.local, item.exec.block, item.exec.statement_index);
+        eprintln!("[asap]   applied early drop of {:?} at {:?}", item.local, item.exec);
     }
-
-    drop_bb
 }
 
 // ── Step 1: Temukan locals kandidat ASAP ─────────────────────────────────
@@ -450,15 +507,19 @@ fn operand_sources(op: &Operand<'_>, taint: &HashMap<Local, HashSet<Local>>) -> 
 
 #[derive(Debug)]
 struct LocalAnalysis {
-    /// Lokasi terakhir candidate (atau turunannya) dipakai
+    /// Lokasi terakhir candidate (atau turunannya) dipakai (termasuk moves)
     last_use: Option<Location>,
-    /// max = last_use (lihat catatan di header)
-    safe_drop_point: Option<Location>,
-    /// Block tempat scope drop lama berada
-    existing_drop_block: Option<BasicBlock>,
-    /// True jika candidate di-move-out langsung (skip transform)
+    /// Lokasi terakhir NON-MOVE use (untuk log)
+    last_borrow_use: Option<Location>,
+    /// Lokasi-lokasi Move langsung dari candidate
+    moves: Vec<Location>,
+    /// SEMUA block tempat scope drop berada (cabang = banyak situs)
+    existing_drop_blocks: Vec<BasicBlock>,
+    /// True jika candidate di-move-out langsung (untuk log)
     moved_out: bool,
-    /// Semua lokasi use (untuk guard urutan CFG)
+    /// Lokasi use non-move, unik (untuk guard urutan + anchor borrow)
+    borrow_uses: Vec<Location>,
+    /// Semua lokasi use incl. moves, unik (untuk guard loop)
     uses: Vec<Location>,
 }
 
@@ -477,9 +538,11 @@ fn analyze_body(
         .iter()
         .map(|&l| (l, LocalAnalysis {
             last_use: None,
-            safe_drop_point: None,
-            existing_drop_block: None,
+            last_borrow_use: None,
+            moves: Vec::new(),
+            existing_drop_blocks: Vec::new(),
             moved_out: false,
+            borrow_uses: Vec::new(),
             uses: Vec::new(),
         }))
         .collect();
@@ -496,10 +559,10 @@ fn analyze_body(
                 }
                 StatementKind::FakeRead(inner) => {
                     let (_cause, place) = &**inner;
-                    note_place_use(place.local, false, loc, &ctx, &mut result);
+                    note_place_use(place, false, loc, &ctx, &mut result);
                 }
                 StatementKind::SetDiscriminant { place, .. } => {
-                    note_place_use(place.local, false, loc, &ctx, &mut result);
+                    note_place_use(place, false, loc, &ctx, &mut result);
                 }
                 StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => {
                     // Storage sengaja diabaikan: StorageDead local bernama
@@ -508,11 +571,11 @@ fn analyze_body(
                     // sudah diwakili oleh uses (termasuk FakeRead).
                 }
                 StatementKind::PlaceMention(place) => {
-                    note_place_use(place.local, false, loc, &ctx, &mut result);
+                    note_place_use(place, false, loc, &ctx, &mut result);
                 }
                 StatementKind::AscribeUserType(inner, _) => {
                     let (place, _proj) = &**inner;
-                    note_place_use(place.local, false, loc, &ctx, &mut result);
+                    note_place_use(place, false, loc, &ctx, &mut result);
                 }
                 StatementKind::Intrinsic(inner) => {
                     use rustc_middle::mir::NonDivergingIntrinsic as I;
@@ -529,7 +592,7 @@ fn analyze_body(
                 | StatementKind::Nop
                 | StatementKind::Coverage(_) => {}
                 StatementKind::BackwardIncompatibleDropHint { place, .. } => {
-                    note_place_use(place.local, false, loc, &ctx, &mut result);
+                    note_place_use(place, false, loc, &ctx, &mut result);
                 }
             }
         }
@@ -554,13 +617,22 @@ fn analyze_body(
                 }
                 TerminatorKind::Drop { place, .. } => {
                     if ctx.candidates.contains(&place.local) {
-                        // Scope drop candidate: BUKAN use, dicatat terpisah.
-                        if let Some(analysis) = result.get_mut(&place.local) {
-                            analysis.existing_drop_block = Some(bb);
+                        // Scope drop candidate: BUKAN use. Satu candidate
+                        // bisa punya BANYAK situs (tiap exit path cabang).
+                        // Blok cleanup DIKECUALIKAN: mereka untuk path unwind
+                        // (tetap dibutuhkan bila panic terjadi sebelum/sesudah
+                        // early drop; elaborasi membuatnya kondisional).
+                        // Mereka juga TIDAK BOLEH dinetralkan.
+                        if !bb_data.is_cleanup {
+                            if let Some(analysis) = result.get_mut(&place.local) {
+                                if !analysis.existing_drop_blocks.contains(&bb) {
+                                    analysis.existing_drop_blocks.push(bb);
+                                }
+                            }
                         }
                     } else {
                         // Drop dari value turunan = pemakaian turunan itu.
-                        note_place_use(place.local, false, loc, &ctx, &mut result);
+                        note_place_use(place, false, loc, &ctx, &mut result);
                     }
                 }
                 TerminatorKind::SwitchInt { discr, .. } => {
@@ -602,57 +674,70 @@ fn analyze_body(
     result
 }
 
-/// Catat pemakaian place berakar di `place_local` untuk semua candidate
-/// sumbernya (langsung bila local itu sendiri candidate, tak langsung bila
-/// turunan tainted). `is_move` menandai move-out bila akarnya candidate.
+/// Catat pemakaian place untuk semua candidate sumbernya (langsung bila
+/// local itu sendiri candidate, tak langsung bila turunan tainted).
+/// `is_move` + akar candidate = move-out (dicatat di `moves`);
+/// pemakaian lain (termasuk move dari temp `&`) = borrow-use.
 fn note_place_use(
-    place_local: Local,
+    place: &Place<'_>,
     is_move: bool,
     loc: Location,
     ctx: &Ctx<'_>,
     result: &mut HashMap<Local, LocalAnalysis>,
 ) {
+    let place_local = place.local;
     let Some(srcs) = ctx.taint.get(&place_local) else {
         return;
     };
     // Clone kecil: hindari pinjam `taint` sambil mutasi `result`.
-    // (taint dan result objek berbeda, tapi borrow checker butuh ini
-    //  karena keduanya diakses via ctx/result — sebenarnya aman langsung;
-    //  clone untuk kejelasan.)
     let srcs: Vec<Local> = srcs.iter().copied().collect();
     for source in srcs {
         if let Some(analysis) = result.get_mut(&source) {
-            if is_move && place_local == source {
+            let direct_move = is_move && place_local == source;
+            if direct_move {
                 analysis.moved_out = true;
+                push_unique(&mut analysis.moves, loc);
+            } else {
+                analysis.last_borrow_use = Some(match analysis.last_borrow_use {
+                    None => loc,
+                    Some(prev) => location_max(Some(prev), Some(loc)).unwrap(),
+                });
+                push_unique(&mut analysis.borrow_uses, loc);
             }
             analysis.last_use = Some(match analysis.last_use {
                 None => loc,
                 Some(prev) => location_max(Some(prev), Some(loc)).unwrap(),
             });
-            analysis.uses.push(loc);
+            push_unique(&mut analysis.uses, loc);
         }
+    }
+}
+
+fn push_unique(v: &mut Vec<Location>, loc: Location) {
+    if !v.contains(&loc) {
+        v.push(loc);
     }
 }
 
 // ── Step 4: Mutasi — sisipkan early Drop, netralkan scope drop lama ───────
 
-/// Split basic block di `after_loc` dan sisipkan Drop terminator.
+/// Split basic block di `split_idx` dan sisipkan Drop terminator.
 ///
 /// ```
-/// Sebelum:
-///   bb_N: [s0, s1, ..., s_k(drop_point), s_k+1, ..., s_n] → orig_term
+/// Sebelum (split_idx = k+1):
+///   bb_N: [s0, s1, ..., s_k, s_k+1, ..., s_n] → orig_term
 ///
 /// Setelah:
 ///   bb_N:    [s0, s1, ..., s_k] → Drop(local) → bb_new
 ///   bb_new:  [s_k+1, ..., s_n] → orig_term
 /// ```
-/// Return block baru. Kalau block yang di-split memuat scope drop lama
-/// sebagai terminatornya, drop lama ikut pindah ke block baru.
-fn insert_drop_after(body: &mut Body<'_>, local: Local, after_loc: Location) -> BasicBlock {
-    let bb = after_loc.block;
-    let split_idx = after_loc.statement_index + 1; // split SETELAH statement ini
-
+/// Return block baru.
+fn insert_drop_at(body: &mut Body<'_>, local: Local, bb: BasicBlock, split_idx: usize) {
     let blocks = body.basic_blocks.as_mut();
+    assert!(
+        split_idx <= blocks[bb].statements.len(),
+        "split_idx out of bounds"
+    );
     let source_info = blocks[bb].terminator().source_info;
     let is_cleanup = blocks[bb].is_cleanup;
 
@@ -677,8 +762,6 @@ fn insert_drop_after(body: &mut Body<'_>, local: Local, after_loc: Location) -> 
             async_fut: None,
         },
     });
-
-    new_bb
 }
 
 /// Ganti Drop terminator di `block` dengan Goto ke target-nya.
@@ -731,7 +814,7 @@ fn visit_rvalue(
             }
         }
         Rvalue::Discriminant(place) | Rvalue::CopyForDeref(place) => {
-            note_place_use(place.local, false, loc, ctx, result);
+            note_place_use(place, false, loc, ctx, result);
         }
         Rvalue::ThreadLocalRef(_) => {}
     }
@@ -744,8 +827,8 @@ fn visit_operand(
     result: &mut HashMap<Local, LocalAnalysis>,
 ) {
     match op {
-        Operand::Move(place) => note_place_use(place.local, true, loc, ctx, result),
-        Operand::Copy(place) => note_place_use(place.local, false, loc, ctx, result),
+        Operand::Move(place) => note_place_use(place, true, loc, ctx, result),
+        Operand::Copy(place) => note_place_use(place, false, loc, ctx, result),
         Operand::Constant(_) | Operand::RuntimeChecks(_) => {}
     }
 }

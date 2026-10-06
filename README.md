@@ -145,10 +145,22 @@ Patterns covered by `asap-test`:
     borrows (`&a`), calls receiving those borrows, and reborrows;
     every `FakeRead`, `PlaceMention`, intrinsic, and asm operand counts
     as a use.
-  - Owned values derived from a candidate (e.g.
-    `let cloned = early.clone()`) are promoted to candidates themselves
-    (fixpoint), so they also drop right after their last use. Borrow
-    temporaries (`&T`) are never promoted.
+- Owned values derived from a candidate (e.g.
+  `let cloned = early.clone()`) are promoted to candidates themselves
+  (fixpoint), so they also drop right after their last use. Borrow
+  temporaries (`&T`) are never promoted.
+- Insertion is per-path (NLL-equivalent), possibly several points per
+  variable, plus one point after each direct move ("drop after last
+  move" — always a conditional no-op, so it is safe):
+  - no move: drop right after the last borrow-use on each path;
+  - mixed borrow/move branches: a point on each path;
+  - a borrow point is only placed where no later move is reachable
+    from it (borrowck would reject drop-then-move as a compile error).
+- Only scope-drop sites dominated by an inserted point are neutralized;
+  other paths (early returns, move paths) keep their original drops.
+  Cleanup (unwind) blocks are never touched.
+  Returning the value itself is a move (nothing left to drop); returning
+  a borrow of a local is rejected by borrowck with or without the driver.
   - Guards: all uses must be CFG-ordered before the drop point
     (`Location::is_predecessor_of`), the drop point must reach the old
     scope drop, and move-outs (by-value moves, returning the value) are
