@@ -1,20 +1,32 @@
 #!/usr/bin/env bash
-# run-asap.sh — build & run dengan ASAP driver, selalu paksa recompile.
+# run-asap.sh — jalankan command cargo APAPUN dengan ASAP driver.
 #
-# Kenapa perlu? Mengganti RUSTC_WRAPPER saja tidak selalu membuat cargo
-# recompile (biner lama yang jalan → hasilnya terlihat seperti baseline).
-# Script ini memaksa recompile target dulu agar driver benar-benar dijalankan.
+# Command-nya passthrough penuh ke cargo (bukan fixed `run`), jadi semua
+# command cargo didukung: run, build, check, test, expand, ...
 #
-#   ./run-asap.sh                  # project di current dir, mode debug
-#   ./run-asap.sh --release        # project di current dir, mode release
-#   ./run-asap.sh -p tes           # crate tes di workspace, mode debug
-#   ./run-asap.sh -p tes --release # crate tes di workspace, mode release
+#   ./run-asap.sh run -p tes             # ala `cargo run -p tes`
+#   ./run-asap.sh run --release          # project di current dir
+#   ./run-asap.sh build -p tes
+#   ./run-asap.sh check
+#   ./run-asap.sh test -- --nocapture
+#   ./run-asap.sh expand -p tes          # butuh cargo-expand
+#   ./run-asap.sh                        # tanpa arg = `run`
+#
+# Kenapa perlu script ini? Mengganti RUSTC_WRAPPER saja tidak selalu membuat
+# cargo recompile (biner lama yang jalan → hasilnya terlihat seperti
+# baseline). Script ini memaksa recompile target dulu agar driver
+# benar-benar dijalankan.
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CALLER_DIR="$(pwd)"
 
-# Ambil nilai -p/--package bila ada.
+# Tanpa arg sama sekali = `run` (tetap dukung kebiasaan lama).
+if [ "$#" = "0" ]; then
+    set -- run
+fi
+
+# Ambil nilai -p/--package bila ada (untuk force-recompile paket itu).
 PKG=""
 WANT_PKG=0
 for a in "$@"; do
@@ -52,6 +64,6 @@ else
 fi
 
 echo ""
-echo "=== Run dengan ASAP driver: cargo +nightly run $* ==="
+echo "=== cargo +nightly $* (dengan ASAP driver) ==="
 cd "$RUN_DIR"
-RUSTC_WRAPPER="$DRIVER" cargo +nightly run "$@"
+RUSTC_WRAPPER="$DRIVER" cargo +nightly "$@"

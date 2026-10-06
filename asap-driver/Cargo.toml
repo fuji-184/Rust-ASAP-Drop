@@ -8,4 +8,4 @@ name = "asap-driver"
 path = "src/main.rs"
 
 # Tidak perlu depend on asap-runtime di sini —
-# kita kenali AsapOwned via string matching di type system rustc
+# kita kenali Call ke __asap_identity via string matching di type system rustc

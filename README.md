@@ -1,15 +1,16 @@
 # ASAP Drop
 
-`asap!(expr)` wraps a value in `AsapOwned<T>` as a **marker** so the
-MIR pass (`asap-driver`) can detect variables that may be dropped
-as soon as possible (after the *last use* / after borrows end) instead of
-at the end of the scope.
+`asap!(expr)` marks a value for ASAP dropping while keeping its **original
+type** `T`, so the MIR pass (`asap-driver`) can drop variables as soon as
+possible (after the *last use* / after borrows end) instead of at the end
+of the scope. Bypassing by value, borrowing, and method calls all work
+natively — no wrapper type, no signature changes.
 
 Workspace layout:
 
-- `asap-macro/` — proc macro `asap!(expr)` → `::asap_runtime::AsapOwned::new(expr)`
-- `asap-runtime/` — marker type `AsapOwned<T>` (repr transparent, `Deref`/`DerefMut` into `T`)
-- `asap-driver/` — `rustc` replacement binary, injects the ASAP analysis via `RUSTC_WRAPPER`
+- `asap-macro/` — proc macro `asap!(expr)` → `::asap_runtime::__asap_identity(expr)`
+- `asap-runtime/` — `__asap_identity` marker fn
+- `asap-driver/` — `rustc` replacement binary, injects the ASAP transform via `RUSTC_WRAPPER`
 - `asap-test/` — demo + tests (`Tracked`, asap/non-asap mix, borrows, Vec, Mutex guard)
 
 ## Requirements
@@ -92,11 +93,14 @@ Code:
 ```rust
 use asap_macro::asap;
 
+fn takes_ownership(v: Vec<i32>) { /* ... */ }
+
 fn main() {
-    let a = asap!(vec![10, 20, 30]);
-    a.push(40);              // DerefMut into Vec, feels like a plain Vec
+    let a = asap!(vec![10, 20, 30]); // a: Vec<i32> — real type!
+    a.push(40);
+    takes_ownership(a.clone()); // by-value works natively
     let sum: i32 = a.iter().sum();
-    // last use of a above
+    // last use of a above → dropped here with the driver
 
     let b = vec![1, 2, 3];   // plain value, untouched by ASAP
     println!("{}", sum + b.iter().sum::<i32>());
@@ -110,13 +114,13 @@ RUSTC_WRAPPER="/path/to/asap-driver" cargo +nightly build
 RUSTC_WRAPPER="/path/to/asap-driver" cargo +nightly run
 ```
 
-Normal borrow rules still apply: while an `&*a` borrow is alive,
+Normal borrow rules still apply: while an `&a` borrow is alive,
 the drop is delayed until the borrow ends.
 
 Patterns covered by `asap-test`:
 
 - `test_mix` — mixes `let normal` and `let early = asap!(...)` in one scope
-- `test_borrow_delays_drop` — `let r = &*a;` delays the drop
+- `test_borrow_delays_drop` — `let r = &a;` delays the drop
 - `test_chained` — several asap variables, each dropped independently
 - `test_with_vec` — `asap!(vec![...])`
 - `test_mutex_early_unlock` — `asap!(data.lock().unwrap())`
@@ -125,7 +129,8 @@ Patterns covered by `asap-test`:
 
 - The driver **builds and runs on nightly 1.97** and performs a real
   early-drop transform: it wraps the `mir_built` query via
-  `override_queries`, finds `AsapOwned<T>` locals (visible as
+  `override_queries`, finds locals initialized through
+  `asap_runtime::__asap_identity` (visible as
   `[asap] Found candidate` / `[asap] early-drop ...` logs), splits the
   block after the last use, inserts a `Drop` terminator, and neutralizes
   the old scope drop (`Drop` → `Goto`, so no double-drop).
@@ -137,11 +142,16 @@ Patterns covered by `asap-test`:
     placement is rejected by borrowck as a compile error instead of
     miscompiling silently.
   - Taint analysis tracks values derived from a candidate through
-    `&*a`, `Deref::deref` call chains, and reborrows; every `FakeRead`,
-    `PlaceMention`, intrinsic, and asm operand counts as a use.
+    borrows (`&a`), calls receiving those borrows, and reborrows;
+    every `FakeRead`, `PlaceMention`, intrinsic, and asm operand counts
+    as a use.
+  - Owned values derived from a candidate (e.g.
+    `let cloned = early.clone()`) are promoted to candidates themselves
+    (fixpoint), so they also drop right after their last use. Borrow
+    temporaries (`&T`) are never promoted.
   - Guards: all uses must be CFG-ordered before the drop point
     (`Location::is_predecessor_of`), the drop point must reach the old
-    scope drop, and move-outs (`into_inner`, returning the value) are
+    scope drop, and move-outs (by-value moves, returning the value) are
     skipped. Doubtful cases (loops/branches with unclear order) fall back
     to the normal end-of-scope drop.
 - Known limitations:

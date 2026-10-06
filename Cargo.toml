@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "asap-macro",    # proc macro: asap!(expr) → AsapOwned<T>
-    "asap-runtime",  # runtime marker type: AsapOwned<T>
+    "asap-macro",    # proc macro: asap!(expr) → __asap_identity(expr)
+    "asap-runtime",  # runtime marker fn: __asap_identity
     "asap-driver",   # custom rustc binary
     "asap-test", "tes",     # test & demo
 ]

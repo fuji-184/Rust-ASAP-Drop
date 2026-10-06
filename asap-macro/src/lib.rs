@@ -6,36 +6,38 @@
 //
 // menjadi:
 //
-//   ::asap_runtime::AsapOwned::new(expr)
+//   ::asap_runtime::__asap_identity(expr)
 //
-// Sesederhana itu di sisi macro — "magic" ada di MIR pass
-// yang berjalan di asap-driver.
+// PENTING: tipe kembaliannya T ASLI (bukan wrapper), sehingga user code
+// tidak berubah sama sekali — by-value, borrow, dan method call semuanya
+// native. "Magic"-nya ada di MIR pass (asap-driver) yang mendeteksi local
+// yang diinisialisasi lewat Call ke `__asap_identity` dan memindahkan
+// Drop-nya lebih awal.
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, Expr};
 
-/// Wrap sebuah expression dengan ASAP drop semantics.
+/// Tandai sebuah expression dengan ASAP drop semantics.
 ///
 /// Variable yang dibungkus `asap!()` akan di-drop segera setelah
 /// last use (atau setelah semua borrow selesai), bukan di akhir scope.
+/// Tipe variable TETAP tipe aslinya — tidak ada wrapper:
 ///
-/// # Contoh
-///
-/// ```rust
+/// ```rust,ignore
 /// use asap_macro::asap;
 ///
+/// fn takes_ownership(v: Vec<i32>) { /* ... */ }
+/// fn borrows(v: &Vec<i32>) { /* ... */ }
+///
 /// fn example() {
-///     let a = asap!(vec![1, 2, 3]);     // Vec di-drop segera setelah last use
-///     let b = asap!(String::from("hi")); // String di-drop segera setelah last use
+///     let a = asap!(vec![1, 2, 3]); // a: Vec<i32>, bukan wrapper!
 ///
-///     println!("{:?}", *a);  // use a
+///     takes_ownership(a.clone()); // by-value biasa
+///     borrows(&a);                // borrow biasa
+///
+///     let sum: i32 = a.iter().sum(); // last use
 ///     // a di-drop di sini (bukan di akhir fungsi)
-///
-///     println!("{}", *b);    // use b
-///     // b di-drop di sini
-///
-///     // ... kode lain tanpa a dan b di memory ...
 /// }
 /// ```
 ///
@@ -43,9 +45,9 @@ use syn::{parse_macro_input, Expr};
 ///
 /// Jika ada borrow yang masih aktif, drop ditunda sampai borrow selesai:
 ///
-/// ```rust
+/// ```rust,ignore
 /// let a = asap!(vec![1, 2, 3]);
-/// let r = &*a;           // borrow aktif
+/// let r = &a;            // borrow aktif
 /// println!("{:?}", r);   // last use of borrow
 /// // a di-drop DI SINI, setelah borrow r selesai
 /// ```
@@ -53,23 +55,10 @@ use syn::{parse_macro_input, Expr};
 pub fn asap(input: TokenStream) -> TokenStream {
     let expr = parse_macro_input!(input as Expr);
 
-    // Validasi: beberapa expression tidak masuk akal untuk di-wrap
-    match &expr {
-        // asap!(42) — primitive tidak punya destructor, tidak berguna
-        // tapi kita allow saja, hanya buang-buang type wrapper
-        // (MIR pass akan skip karena tidak implement Drop)
-        Expr::Lit(_) => {
-            // Tetap wrap supaya API konsisten, MIR pass akan skip
-        }
-        // asap!({ ... block ... }) — valid, wrap seluruh block
-        Expr::Block(_) => {}
-        // Kasus normal: function call, struct init, method chain, dll
-        _ => {}
-    }
-
     let expanded = quote! {
-        // Gunakan path absolut agar tidak perlu user import manual
-        ::asap_runtime::AsapOwned::new(#expr)
+        // Path absolut agar user tidak perlu import manual.
+        // Identity call ini yang dideteksi MIR pass sebagai marker.
+        ::asap_runtime::__asap_identity(#expr)
     };
 
     expanded.into()
@@ -78,7 +67,7 @@ pub fn asap(input: TokenStream) -> TokenStream {
 /// Variant untuk closure — berguna kalau construction-nya expensive
 /// dan ingin lazy:
 ///
-/// ```rust
+/// ```rust,ignore
 /// let a = asap_lazy!(|| expensive_computation());
 /// ```
 ///
@@ -90,7 +79,7 @@ pub fn asap_lazy(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         // Evaluate closure langsung — lazy hanya soal keterbacaan
-        ::asap_runtime::AsapOwned::new((#expr)())
+        ::asap_runtime::__asap_identity((#expr)())
     };
 
     expanded.into()

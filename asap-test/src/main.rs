@@ -73,7 +73,7 @@ fn test_borrow_delays_drop(log: &Arc<Mutex<Vec<String>>>) {
 
     a.use_it();         // last direct use of a
 
-    let r = &*a;        // borrow a — drop harus ditunda!
+    let r = &a;            // borrow a — drop harus ditunda!
     r.use_it();         // last use of borrow r
     // r expired di sini
 

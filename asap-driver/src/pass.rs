@@ -2,17 +2,20 @@
 //
 // Inti dari ASAP Drop:
 //
-//  1. Scan locals yang bertipe AsapOwned<T>       → "candidates"
+//  1. Scan locals yang diinisialisasi via `asap_runtime::__asap_identity`
+//     (hasil macro `asap!`)                        → "candidates"
+//     + PROMOSI: owned locals yang diturunkan dari candidate
+//     (mis. `let cloned = early.clone()`) ikut jadi kandidat (fixpoint).
 //  2. Taint flow-insensitive: local apa pun yang nilainya diturunkan dari
-//     candidate (`&*a`, hasil `Deref::deref(a)`, salinan ref, ...) dicatat
-//     sebagai turunan candidate. Ini menangani rantai Deref yang tidak
-//     terlihat sebagai `Ref` langsung di MIR.
+//     candidate (`&a`, hasil call yang menerima borrow candidate, salinan
+//     ref, ...) dicatat sebagai turunan candidate.
 //  3. Untuk tiap candidate, cari last_use = lokasi terakhir candidate
 //     ATAU turunannya dipakai (mencakup FakeRead/PlaceMention/asm/intrinsic).
 //     StorageDead SENGAJA tidak dipakai: local bernama (mis. `let r = &*a`)
 //     di-StorageDead di akhir fungsi, jauh setelah borrow-nya mati menurut
 //     NLL. last_use + validasi borrowck sudah cukup dan tepat.
-//  4. safe_drop_point = last_use
+//  4. safe_drop_point = last_use (move-out di-skip: value sudah pindah,
+//     mis. di-pass by-value ke fungsi lain — early drop tidak ada gunanya)
 //  5. Split basic block di safe_drop_point, sisipkan Drop terminator
 //  6. Netralkan scope drop lama (Drop → Goto) → tidak double-drop
 //
@@ -25,8 +28,8 @@
 //    CFG (`Location::is_predecessor_of`), dan titik drop harus mencapai
 //    scope drop lama. Kasus loop/branch yang meragukan di-skip (fallback
 //    ke drop normal di akhir scope).
-//  - Kasus move-out (`Move` langsung dari candidate, mis. `into_inner`)
-//    di-skip: value sudah pindah, early drop tidak ada gunanya.
+//  - Kasus move-out (`Move` langsung dari candidate, mis. di-pass
+//    by-value ke fungsi lain) di-skip: tidak ada yang perlu di-drop awal.
 //
 // Catatan kompatibilitas nightly:
 //  - `MirPass` tidak lagi publik → pass ini struct biasa.
@@ -70,14 +73,40 @@ enum InsertPoint {
 // ── Entry: susun rencana transform untuk satu body ─────────────────────────
 
 pub fn plan_asap_transform<'a>(tcx: TyCtxt<'a>, body: &Body<'a>) -> Vec<AsapDrop> {
-    let candidates = find_asap_candidates(tcx, body);
+    let mut candidates = find_asap_candidates(tcx, body);
     if candidates.is_empty() {
         return Vec::new();
     }
 
     // Taint flow-insensitive: local -> set candidate sumber.
-    // Menangani `&*a` langsung, rantai `Deref::deref(a)`, dan reborrow.
-    let taint = compute_taint(body, &candidates);
+    // Lalu PROMOSI: local owned (bukan reference) yang nilainya diturunkan
+    // dari candidate (mis. `let cloned = early.clone()`) ikut menjadi
+    // kandidat — mereka value independen yang juga boleh di-drop awal.
+    // Iterasi sampai fixpoint (promosi hanya menambah, berhimpit di #locals).
+    let mut taint = compute_taint(body, &candidates);
+    loop {
+        let mut grown = false;
+        for (local, srcs) in &taint {
+            if candidates.contains(local) || srcs.is_empty() {
+                continue;
+            }
+            // Skip return value (_0) dan args; skip reference (borrow temps
+            // bukan owned value — liveness mereka diatur via candidate asal).
+            if local.as_u32() == 0 || local.as_u32() <= body.arg_count as u32 {
+                continue;
+            }
+            if matches!(body.local_decls[*local].ty.kind(), TyKind::Ref(..)) {
+                continue;
+            }
+            eprintln!("[asap]   promote {:?} to candidate (derives from {:?})", local, srcs);
+            candidates.insert(*local);
+            grown = true;
+        }
+        if !grown {
+            break;
+        }
+        taint = compute_taint(body, &candidates);
+    }
 
     let mut analysis = analyze_body(body, &candidates, &taint);
     for info in analysis.values_mut() {
@@ -255,34 +284,52 @@ fn insert_drop_before_succ(
     drop_bb
 }
 
-// ── Step 1: Temukan locals bertipe AsapOwned<T> ───────────────────────────
+// ── Step 1: Temukan locals kandidat ASAP ─────────────────────────────────
+//
+// Kandidat = destination dari Call ke `asap_runtime::__asap_identity`
+// (hasil macro `asap!`). Tipe local adalah T ASLI.
 
 fn find_asap_candidates<'a>(tcx: TyCtxt<'a>, body: &Body<'a>) -> HashSet<Local> {
     let mut candidates = HashSet::new();
 
-    for (local, decl) in body.local_decls.iter_enumerated() {
-        // Skip return value (_0) dan args
-        if local.as_u32() == 0 || local.as_u32() <= body.arg_count as u32 {
+    for bb_data in body.basic_blocks.iter() {
+        let Some(term) = &bb_data.terminator else {
+            continue;
+        };
+        let TerminatorKind::Call { func, destination, .. } = &term.kind else {
+            continue;
+        };
+        if !is_asap_identity_call(tcx, func) {
             continue;
         }
-
-        let ty = decl.ty;
-
-        // Cek apakah tipe ini adalah AsapOwned<_>
-        if let TyKind::Adt(adt_def, _) = ty.kind() {
-            let name = tcx.item_name(adt_def.did());
-            if name.as_str() == "AsapOwned" {
-                // Double-check: crate-nya adalah asap_runtime
-                let crate_name = tcx.crate_name(adt_def.did().krate);
-                if crate_name.as_str() == "asap_runtime" {
-                    candidates.insert(local);
-                    eprintln!("[asap]   Found candidate: {:?} : {:?}", local, ty);
-                }
-            }
+        let dest = destination.local;
+        // Skip return value (_0) dan args
+        if dest.as_u32() == 0 || dest.as_u32() <= body.arg_count as u32 {
+            continue;
+        }
+        if candidates.insert(dest) {
+            eprintln!(
+                "[asap]   Found candidate: {:?} : {:?}",
+                dest, body.local_decls[dest].ty
+            );
         }
     }
 
     candidates
+}
+
+/// True bila operand fungsi adalah Call ke `asap_runtime::__asap_identity`.
+fn is_asap_identity_call<'a>(tcx: TyCtxt<'a>, func: &Operand<'a>) -> bool {
+    let Operand::Constant(c) = func else {
+        return false;
+    };
+    let ty = c.const_.ty();
+    if let TyKind::FnDef(def_id, _args) = ty.kind() {
+        tcx.item_name(*def_id).as_str() == "__asap_identity"
+            && tcx.crate_name(def_id.krate).as_str() == "asap_runtime"
+    } else {
+        false
+    }
 }
 
 // ── Step 2: Taint — local apa yang diturunkan dari candidate ──────────────

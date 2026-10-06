@@ -1,5 +1,6 @@
 use asap_macro::asap;
 
+#[derive(Clone)]
 struct Tracked {
     name: &'static str,
 }
@@ -38,11 +39,25 @@ fn main() {
     normal.use_it();
     early.use_it();
 
-    normal.use_it();
-
     drop(normal);
 
     let early  = asap!(Tracked::new("variable that uses asap drop, the new 2nd"));
+    
+    let cloned = early.clone();
+    borrow(&cloned);
+    
     borrow(&early);
     moved(early);
+
+    let early  = asap!(Tracked::new("variable that uses asap drop, branching"));
+
+    if 1 == 1 {
+        borrow(&early);
+        
+    } else {
+        moved(early); 
+    }
+
+    println!("after branching");
+
 }
